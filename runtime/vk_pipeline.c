@@ -724,6 +724,10 @@ static uint32_t *spirv_dual_source(const uint32_t *w, uint64_t n, uint64_t *out_
 // colour output 0's alpha does not compare true with the reference, before blending; NaN fails. So before each return of
 // the entry point this adds: load Location 0, compare its w, OpKill when false. The pipeline is keyed by GKey.alpha, so
 // only draws with a test get this module. NULL when the module has no float vec4 Output at Location 0.
+// Two cases follow Eglantine, our default reference, without an NVN source for either. A game draw that needs the other
+// answer decides them. EarlyFragmentTests stays, so with depth or stencil writes on, a rejected fragment has already
+// written them. NEVER on a module without that output also gets NULL, so the draw runs with no test: Eglantine checks for
+// a colour output first, Ryujinx discards first.
 static uint32_t *spirv_alpha_test(const uint32_t *w, uint64_t n, unsigned func, float ref, uint64_t *out_n) {
     enum { OP_TYPE_BOOL = 20, OP_FUNCTION_END = 56, OP_LOAD = 61, OP_COMPOSITE_EXTRACT = 81, OP_SELECTION_MERGE = 247,
            OP_LABEL = 248, OP_BRANCH_CONDITIONAL = 250, OP_KILL = 252, OP_RETURN = 253, RETURN_WORDS = 26 };
@@ -1062,19 +1066,211 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
     st->pNext = rq;
 }
 
-static VkShaderModule make_module_linked(const uint32_t *w, uint64_t words, int geometry_chain) {
+// DKB_DUMP_SPV=1 (debug only, for #75): the exact words handed to vkCreateShaderModule, after every rewrite, saved as
+// <log folder>/spv/<vs|fs|gs|cs>-<NVN 2 stage origin>-<FNV-1a 64 of the bytes>.spv, so a SPIR-V hash from a driver
+// crash dump can be matched to its NVN 2 stage. The files hold code derived from the game: local only, ignored by git.
+static void spv_dump(const uint32_t *w, uint64_t words, const GfxShader *src) {
+    static int on = -1;
+    static volatile int64_t total;
+    if (on < 0) on = cfg_get("TOTK_DUMP_SPV") != NULL;
+    const char *lp = on ? rt_log_path() : NULL, *cut = lp ? strrchr(lp, '/') : NULL;
+    if (!cut || !src) return;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < words * 4; i++) h = (h ^ ((const uint8_t *)w)[i]) * 0x100000001b3ull;
+    static const char *const kind[] = {[GFX_STAGE_VS] = "vs", [GFX_STAGE_GS] = "gs", [GFX_STAGE_FS] = "fs", [GFX_STAGE_CS] = "cs"};
+    int st = gfx_shader_stage(src);
+    char dir[PLAT_PATH_MAX * 3], name[48], path[PLAT_PATH_MAX * 3 + 64];
+    snprintf(dir, sizeof dir, "%.*s/spv", (int)(cut - lp), lp);
+    snprintf(name, sizeof name, "%s-%016llx-%016llx.spv", st >= 0 && st < 6 && kind[st] ? kind[st] : "xx",
+             (unsigned long long)gfx_shader_origin(src), (unsigned long long)h);
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (plat_file_exists(path)) return;
+    if (__atomic_fetch_add(&total, (int64_t)words * 4, __ATOMIC_RELAXED) + (int64_t)words * 4 > (1ll << 30)) return;   // 1 GiB cap
+    plat_file_mkdir_p(dir);
+    if (plat_file_write_atomic(path, w, (size_t)words * 4)) rt_log("vk: spv dump %s %llu bytes", name, (unsigned long long)words * 4);
+}
+
+// DKB_SPV_OVERRIDE=<16-hex FNV-1a 64 name>:<path.spv>[,...] (debug only, for #75, max 8 entries): a module whose final
+// SPIR-V hashes to <name> (the hash in the spv_dump file name) is created from the file instead. Parsed once.
+static uint32_t *spv_override(const uint32_t *w, uint64_t words, uint64_t *out_words) {
+    static struct { uint64_t h; char path[PLAT_PATH_MAX * 3]; int bad; } ent[8];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *e = cfg_get("TOTK_SPV_OVERRIDE");
+        while (e && *e && n < 8) {
+            char *end;
+            unsigned long long h = strtoull(e, &end, 16);
+            const char *p = end + 1, *q = strchr(p, ',');
+            size_t len = q ? (size_t)(q - p) : strlen(p);
+            if (*end == ':' && len && len < sizeof ent[0].path) {
+                ent[n].h = h;
+                memcpy(ent[n].path, p, len), ent[n].path[len] = 0;
+                n++;
+            }
+            e = q ? q + 1 : NULL;
+        }
+    }
+    if (!n) return NULL;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < words * 4; i++) h = (h ^ ((const uint8_t *)w)[i]) * 0x100000001b3ull;
+    for (int i = 0; i < n; i++) {
+        if (ent[i].h != h || ent[i].bad) continue;
+        FILE *f = fopen(ent[i].path, "rb");
+        long sz = -1;
+        if (f && fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+        uint32_t *buf = sz > 0 && sz % 4 == 0 && sz <= (16 << 20) && fseek(f, 0, SEEK_SET) == 0 ? malloc((size_t)sz) : NULL;
+        if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz) {
+            fclose(f);
+            rt_log("vk: SPIR-V override %016llx <- %s", (unsigned long long)h, ent[i].path);
+            *out_words = (uint64_t)sz / 4;
+            return buf;
+        }
+        if (f) fclose(f);
+        free(buf);
+        ent[i].bad = 1;
+        rt_log("vk: SPIR-V override %016llx: cannot use %s (missing, not a multiple of 4 bytes or over 16 MiB); keeping the original",
+               (unsigned long long)h, ent[i].path);
+    }
+    return NULL;
+}
+
+// DKB_FMZ=vertex|all (debug workaround for #75, off by default): NVIDIA's fused-multiply-zero rule (the DX9 rule, 0 * x = 0
+// even for Inf and NaN) for 32-bit float scalar and vector OpFMul and GLSL.std.450 Fma. Each such instruction
+//   r = a * b       becomes   t = a * b;     r = (a == 0 || b == 0) ? 0 : t
+//   r = fma(a,b,c)  becomes   t = fma(a,b,c); r = (a == 0 || b == 0) ? c : t
+// and keeps its original result id r, so decorations and uses stay valid. Only modules of the chosen stage (vertex, or
+// every stage) are rewritten. NULL when nothing is rewritten.
+static uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint64_t *out_n, unsigned *n_mul, unsigned *n_fma) {
+    enum { OP_EXT_INST_IMPORT = 11, OP_EXT_INST = 12, OP_TYPE_BOOL = 20, OP_FMUL = 133, OP_FORD_EQUAL = 180,
+           OP_LOGICAL_OR = 166, OP_SELECT = 169, EXT_FMA = 50 };
+    if (n < 5) return NULL;
+    uint32_t bound = w[3], glsl = 0, model = ~0u, boolt[5] = {0}, nb = bound;
+    uint32_t *comps = calloc(bound, 4), *f32 = calloc(bound, 4), *nullc = calloc(bound, 4), *need = calloc(bound, 4);
+    uint32_t *o = NULL;
+    uint32_t need_bool[5] = {0}, newbool[5] = {0};
+    uint64_t fn_at = 0, extra = 0;
+    unsigned mul = 0, fma = 0;
+    int ok = comps && f32 && nullc && need;
+    for (uint64_t i = 5; ok && i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) { ok = 0; break; }
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_ENTRY_POINT && len >= 3 && model == ~0u) model = a[0];
+        else if (op == OP_EXT_INST_IMPORT && len >= 3 && a[0] < bound && !strcmp((const char *)(a + 1), "GLSL.std.450")) glsl = a[0];
+        else if (op == OP_TYPE_BOOL && len == 2 && a[0] < bound) boolt[1] = a[0];
+        else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[0] < bound && a[1] == 32) f32[a[0]] = 1, comps[a[0]] = 1;
+        else if (op == SPV_OP_TYPE_VECTOR && len == 4 && a[0] < bound && a[1] < bound && f32[a[1]] && a[2] >= 2 && a[2] <= 4)
+            f32[a[0]] = 1, comps[a[0]] = a[2];
+        else if (op == SPV_OP_CONSTANT_NULL && len == 3 && a[0] < bound) nullc[a[0]] = a[1];
+        else if (op == SPV_OP_FUNCTION) {
+            if (!fn_at) fn_at = i;
+            if (model == ~0u || (vertex_only && model != 0)) { ok = 0; break; }
+        } else if ((op == OP_FMUL && len == 5) || (op == OP_EXT_INST && len == 8 && glsl && a[2] == glsl && a[3] == EXT_FMA)) {
+            if (a[0] < bound && f32[a[0]]) {
+                need[a[0]] = 1, need_bool[comps[a[0]]] = 1;
+                if (op == OP_FMUL) mul++, extra += 21; else fma++, extra += 21;
+            }
+        }
+        i += len;
+    }
+    if (!ok || !fn_at || !(mul + fma)) { free(comps), free(f32), free(nullc), free(need); return NULL; }
+    for (int c = 2; c <= 4; c++) if (need_bool[c]) need_bool[1] = 1;
+    for (int c = 1; c <= 4; c++) if (need_bool[c] && !boolt[c]) newbool[c] = boolt[c] = nb++, extra += c == 1 ? 2 : 4;
+    for (uint32_t t = 1; t < bound; t++) if (need[t] && !nullc[t]) nullc[t] = nb++, need[t] = 2, extra += 3;
+    o = malloc((n + extra + 8 * 4) * 4);
+    if (!o) { free(comps), free(f32), free(nullc), free(need); return NULL; }
+    uint64_t p = 0;
+    memcpy(o, w, fn_at * 4), p = fn_at;
+    for (int c = 1; c <= 4; c++) {
+        if (!newbool[c]) continue;
+        if (c == 1) o[p++] = 2u << 16 | OP_TYPE_BOOL, o[p++] = boolt[1];
+        else o[p++] = 4u << 16 | SPV_OP_TYPE_VECTOR, o[p++] = boolt[c], o[p++] = boolt[1], o[p++] = c;
+    }
+    // OpConstantNull's result id is the one we built; the table maps type -> id, so write (type, id) pairs
+    for (uint32_t t = 1; t < bound; t++)
+        if (need[t] == 2) o[p++] = 3u << 16 | SPV_OP_CONSTANT_NULL, o[p++] = t, o[p++] = nullc[t];
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        int is_mul = op == OP_FMUL && len == 5, is_fma = op == OP_EXT_INST && len == 8 && glsl && a[2] == glsl && a[3] == EXT_FMA;
+        if ((is_mul || is_fma) && a[0] < bound && f32[a[0]]) {
+            uint32_t T = a[0], r = a[1], x = a[is_mul ? 2 : 4], y = a[is_mul ? 3 : 5], B = boolt[comps[T]], N = nullc[T];
+            uint32_t t = nb++, za = nb++, zb = nb++, z = nb++;
+            if (is_mul) o[p++] = 5u << 16 | OP_FMUL, o[p++] = T, o[p++] = t, o[p++] = x, o[p++] = y;
+            else o[p++] = 8u << 16 | OP_EXT_INST, o[p++] = T, o[p++] = t, o[p++] = glsl, o[p++] = EXT_FMA, o[p++] = x, o[p++] = y, o[p++] = a[6];
+            o[p++] = 5u << 16 | OP_FORD_EQUAL, o[p++] = B, o[p++] = za, o[p++] = x, o[p++] = N;
+            o[p++] = 5u << 16 | OP_FORD_EQUAL, o[p++] = B, o[p++] = zb, o[p++] = y, o[p++] = N;
+            o[p++] = 5u << 16 | OP_LOGICAL_OR, o[p++] = B, o[p++] = z, o[p++] = za, o[p++] = zb;
+            o[p++] = 6u << 16 | OP_SELECT, o[p++] = T, o[p++] = r, o[p++] = z, o[p++] = is_mul ? N : a[6], o[p++] = t;
+        } else {
+            memcpy(o + p, w + i, len * 4), p += len;
+        }
+        i += len;
+    }
+    memcpy(o, w, 5 * 4);
+    o[3] = nb;
+    *out_n = p;
+    *n_mul = mul, *n_fma = fma;
+    free(comps), free(f32), free(nullc), free(need);
+    return o;
+}
+
+static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w, uint64_t words, int geometry_chain) {
     uint64_t fixed_n = 0;
     uint32_t *fixed = geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1) : spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    static int fmz_mode = -1;   // 0 off, 1 vertex stage only, 2 every stage
+    if (fmz_mode < 0) {
+        const char *e = cfg_get("TOTK_FMZ");
+        // On by default for vertex stages (#75): the end-of-tutorial cutscene loses the NVIDIA device without it.
+        fmz_mode = !e ? 1 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 1;
+        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "all")) rt_log("vk: DKB_FMZ=%s ignored, using vertex (use 0, vertex or all)", e);
+    }
+    // DKB_FMZ_SEL=<mask>:<value> (hex, bisection aid for #75): only modules whose FNV-1a 64 hash before the rewrite
+    // satisfies (hash & mask) == value get the FMZ rewrite, so a run can cover a fixed half, quarter, ... of them.
+    static uint64_t fmz_sel_mask, fmz_sel_val;
+    static int fmz_sel_read;
+    if (!fmz_sel_read) {
+        fmz_sel_read = 1;
+        const char *s = cfg_get("TOTK_FMZ_SEL");
+        char *end;
+        if (s && *s) {
+            fmz_sel_mask = strtoull(s, &end, 16);
+            if (*end == ':') fmz_sel_val = strtoull(end + 1, NULL, 16) & fmz_sel_mask;
+            else fmz_sel_mask = 0;
+        }
+    }
+    uint32_t *fmz = NULL;
+    uint64_t pre_h = 0xcbf29ce484222325ull;
+    if (fmz_mode && fmz_sel_mask)
+        for (uint64_t i = 0; i < words * 4; i++) pre_h = (pre_h ^ ((const uint8_t *)w)[i]) * 0x100000001b3ull;
+    if (fmz_mode && (!fmz_sel_mask || (pre_h & fmz_sel_mask) == fmz_sel_val)) {
+        uint64_t fmz_n = 0;
+        unsigned nm = 0, nf = 0;
+        fmz = spirv_fmz(w, words, fmz_mode == 1, &fmz_n, &nm, &nf);
+        if (fmz) {
+            w = fmz, words = fmz_n;
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (uint64_t i = 0; i < words * 4; i++) h = (h ^ ((const uint8_t *)w)[i]) * 0x100000001b3ull;
+            rt_log("vk: FMZ rewrite %016llx mul=%u fma=%u", (unsigned long long)h, nm, nf);
+        }
+    }
+    spv_dump(w, words, src);
+    uint64_t ov_n = 0;
+    uint32_t *ov = spv_override(w, words, &ov_n);
+    if (ov) w = ov, words = ov_n;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
+    free(ov);
+    free(fmz);
     free(fixed);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
-static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
-    return make_module_linked(w, words, 0);
+static VkShaderModule make_module(const GfxShader *src, const uint32_t *w, uint64_t words) {
+    return make_module_linked(src, w, words, 0);
 }
 
 // Experimental GS accepts a deliberately bounded interface: unpacked 32-bit
@@ -1877,6 +2073,15 @@ static uint32_t target_wmask(const VkPipeState *s, int i) {
 
 uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i) { return target_wmask(s, i); }
 
+// The alpha test reference as the pipeline key holds it: rounded to the nearest 1/255 inside (0, 1). Titles that fade
+// with the alpha test move the reference by less than one 8-bit step per frame, and an exact float built a pipeline
+// for every frame of the fade. The threshold moves by at most half a step. Values outside (0, 1) and NaN stay as they
+// are. After Djihads80/Eglantine#544, as ported in zortos293/Lichii ec3a455.
+static float alpha_ref_step(float ref) {
+    if (!(ref > 0.0f && ref < 1.0f)) return ref;
+    return (float)(int)(ref * 255.0f + 0.5f) / 255.0f;
+}
+
 static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
     k->vs = s->vs, k->fs = s->fs, k->gs = s->gs;
@@ -1894,7 +2099,7 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
     k->dsb = s->fs && P.f_dual_src && uses_src1(s);
     k->fbl = s->fs ? s->feedback : 0;
     if (s->fs && s->color.alpha_func >= NVN_ALPHA_FUNC_NEVER && s->color.alpha_func < NVN_ALPHA_FUNC_ALWAYS)
-        k->alpha = (uint8_t)s->color.alpha_func, k->alpha_ref = s->alpha_ref;
+        k->alpha = (uint8_t)s->color.alpha_func, k->alpha_ref = alpha_ref_step(s->alpha_ref);
     if (!P.dyn_clamp) k->clamp = s->depth_clamp && P.f_depth_clamp;
     if (!P.dyn_poly) k->poly_mode = (uint8_t)polygon_mode(s->poly.mode);
     if (!P.dyn_a2c) k->a2c = s->ms.a2c != 0;
@@ -1998,19 +2203,19 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(fcode, fw);
+        if (fcode) fm = make_module(s->fs, fcode, fw);
     }
     if (s->gs) {
         uint64_t gw = 0;
         const uint32_t *gcode = gfx_shader_spirv(s->gs, &gw);
         uint32_t off = binding_span(s->vs) - 1;
         uint32_t *patched = off && gcode ? spirv_rebind(gcode, gw, off) : NULL;
-        if (gcode && (!off || patched)) gm = make_module(patched ? patched : gcode, gw);
+        if (gcode && (!off || patched)) gm = make_module(s->gs, patched ? patched : gcode, gw);
         free(patched);
     }
     // Only a VS linked to GS uses the GS-chain dead-distance declaration policy.
     // Plain VS/FS modules retain their original fixup path and uploaded bytes.
-    vm = make_module_linked(vcode, vw, s->gs != NULL);
+    vm = make_module_linked(s->vs, vcode, vw, s->gs != NULL);
     free(vpatched), free(fpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (!vm || (s->fs && !fm) || (s->gs && !gm)) goto out;
@@ -2093,6 +2298,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                        .pDynamicState = &dy, .layout = l->layout};
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    pi.flags |= vk_pipeline_capture_flags();
     uint64_t p0 = perf_begin();
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
@@ -2158,7 +2364,8 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = P.n_dyn, .pDynamicStates = P.dyn};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
-                                       .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR, .pDynamicState = &dy};
+                                       .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | vk_pipeline_capture_flags(),
+                                       .pDynamicState = &dy};
     VkShaderModule m = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pName = "main"};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq;
@@ -2206,7 +2413,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         sw = vw;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
-        if (!(m = make_module(vcode, vw))) goto out;
+        if (!(m = make_module(s->vs, vcode, vw))) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
         pi.stageCount = 1, pi.pStages = &st, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
@@ -2227,7 +2434,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
             free(d), free(at);
-            if (!patched || !(m = make_module(patched, fw))) goto out;
+            if (!patched || !(m = make_module(s->fs, patched, fw))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -2440,7 +2647,7 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
         VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4,
                                              .pLibraries = lib};
         VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
-                                           .layout = l->layout};
+                                           .flags = vk_pipeline_capture_flags(), .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
@@ -3182,13 +3389,13 @@ static void prebuild_start(void) {
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
-    VkShaderModule m = make_module(code, words);
+    VkShaderModule m = make_module(cs, code, words);
     if (!m) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
-                                      .layout = l->layout};
+                                      .flags = vk_pipeline_capture_flags(), .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
@@ -3584,7 +3791,7 @@ static void lb_warm_prepared(const char *dir) {
 // totk.exe --prepare-shaders (tools/prepare_shaders.py): the device sets the translator's host answers (they are in every
 // cache key), the seed next to totk.exe is translated on every core, then every prepared variant's stage library or
 // compute pipeline is built once into the driver's disk cache (lb_warm_prepared). No game runs.
-int vk_pipeline_prepare_shaders(void) {
+static int prepare_shaders(int libraries) {
     if (!ensure_init()) {
         fprintf(stderr, "prepare-shaders: no Vulkan device\n");
         return 1;
@@ -3598,9 +3805,15 @@ int vk_pipeline_prepare_shaders(void) {
     const char *pe = cfg_get("TOTK_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
-    if (!rc) lb_warm_prepared(dir);
+    if (!rc && libraries) lb_warm_prepared(dir);
     return rc;
 }
+
+int vk_pipeline_prepare_shaders(void) { return prepare_shaders(1); }
+
+// dkb.exe --translate-shaders (installer/bananza.py): the translation and shader-prepared.bin only, so a driver that
+// crashes while building the libraries cannot fail it. --warm-shaders builds the libraries afterwards.
+int vk_pipeline_translate_shaders(void) { return prepare_shaders(0); }
 
 // totk.exe --warm-shaders: every variant of shader-prepared.bin built into the driver's disk cache again from the shader
 // cache, without translating the seed. The AMD cache is keyed to the exe path (a relink keeps it: 29,587 variants in

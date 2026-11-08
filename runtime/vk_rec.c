@@ -2,7 +2,7 @@
 // consumer (the recorder) share a ring of 64-bit words. A packet is a header word (op, length in words) and the
 // call's arguments; its pointers point into the packet itself, so the recorder passes the payload to the driver as
 // it is. A packet never wraps: one that does not fit before the end is preceded by a pad. The producer publishes head
-// after each packet; the recorder makes the calls and advances tail, which the producer waits on when the ring is
+// after each packet, or every TOTK_REC_BATCH packets when that is set; the recorder makes the calls and advances tail, which the producer waits on when the ring is
 // full and in rec_drain. While a part is recorded the recorder spins on head; idle, it sleeps on an event.
 // Design: Savage Wind Recomp #189 and LAS Recomp runtime/nvn/vulkan/record.c (https://github.com/peiikai/LASRecomp
 // @ a4b53a3, MIT, Copyright (c) 2026 Peiikai); the code is ours.
@@ -18,8 +18,13 @@
 
 #define RING_WORDS (1u << 21)   // 16 MiB: a part of a submission is ~1-2 MiB of packets in the town
 static uint64_t ring[RING_WORDS];
-static volatile uint64_t head, tail;   // words published by the producer / consumed by the recorder
-static volatile int32_t sleeping;         // the recorder waits for wake_ev
+// head and tail each own a cache line: the recorder spins on head, so head must be written only when published and
+// share its line with nothing the producer writes per packet (put_h, unpub, RS_).
+typedef struct { _Alignas(64) volatile uint64_t v; } CacheLine;   // sizeof 64: nothing else shares the line
+static CacheLine head_line, tail_line;
+#define head head_line.v   // words published by the producer
+#define tail tail_line.v   // words consumed by the recorder
+static volatile int32_t sleeping;        // the recorder waits for wake_ev
 static PlatEvent wake_ev;              // auto-reset
 static uint64_t put_h;                 // producer: words written (published up to head)
 static VkCommandBuffer rec_cb;         // the part being recorded (set while the recorder is idle)
@@ -39,7 +44,7 @@ enum {
     R_SetDepthWriteEnable, R_SetFrontFace, R_SetPrimitiveRestartEnable, R_SetPrimitiveTopology,
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
-    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb,
+    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb, R_Checkpoint,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -78,6 +83,11 @@ static void rec_main(void *arg) {
 
 // ---- producer
 
+// TOTK_REC_BATCH=N (0 off): head is published every N packets, not after each, so the recorder's spin does not read a
+// cache line the producer rewrites constantly. Every wait or handoff (wait_space, rec_drain) publishes the rest.
+static int rec_batch;     // read once in rec_begin
+static int unpub;         // producer: packets written since head was last stored
+
 static void wake(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
@@ -86,6 +96,7 @@ static void wake(void) {
 static void wait_space(uint64_t need) {
     if (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) <= RING_WORDS) return;
     RS_.full_waits++;
+    unpub = 0;
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
     while (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) > RING_WORDS) _mm_pause();
@@ -109,6 +120,13 @@ static void *put(uint32_t op, size_t bytes) {
 }
 
 static void pub(void) {
+    if (rec_batch) {
+        if (++unpub < rec_batch) return;
+        unpub = 0;
+        __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+        wake();   // the recorder sleeps more often when batched; a missed wake costs up to 2 ms
+        return;
+    }
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
 }
@@ -116,6 +134,7 @@ static void pub(void) {
 void rec_drain(void) {
     if (!rec_thread || __atomic_load_n(&tail, __ATOMIC_ACQUIRE) == put_h) return;
     uint64_t t0 = now_ns();
+    unpub = 0;
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
     for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) != put_h; i++)
@@ -132,6 +151,10 @@ void rec_begin(VkCommandBuffer cb) {
         // its own parts (rec_end_cb), RDNA 1 and 2 cards ran with it on and off without a loss or a white scene.
         mode = rt_knob("VK_RECORDER", "1");
         if (mode) {
+            rec_batch = cfg_int("TOTK_REC_BATCH");
+            if (rec_batch < 0) rec_batch = 0;
+            if (rec_batch > 64) rec_batch = 64;
+            if (rec_batch) rt_log("vk_rec: batched head publish every %d packets (TOTK_REC_BATCH=%d)", rec_batch, rec_batch);
             plat_event_init(&wake_ev, 0, 0);
             rec_prio = plat_thread_priority_get();
             rec_thread = plat_thread_new(rec_main, NULL, "vk recorder");
@@ -224,13 +247,37 @@ FIXED(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControl
 #define PACK_BindIndexBuffer *a = (A_BindIndexBuffer){b, o, t}
 FIXED(BindIndexBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t), (cb, b, o, t), VkBuffer b;
       VkDeviceSize o; VkIndexType t)
-#define PACK_BindPipeline *a = (A_BindPipeline){bp, p}
-FIXED(BindPipeline, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p), (cb, bp, p), VkPipelineBindPoint bp;
-      VkPipeline p)
-#define PACK_Dispatch *a = (A_Dispatch){x, y, z}
-FIXED(Dispatch, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z), uint32_t x, y, z)
-#define PACK_DispatchIndirect *a = (A_DispatchIndirect){b, o}
-FIXED(DispatchIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o), (cb, b, o), VkBuffer b; VkDeviceSize o)
+// DKB_GPU_CHECKPOINTS=1: a checkpoint in front of a dispatch, copy, blit or clear (vk_crumbs.c vk_checkpoint_tag), so a
+// lost device names that command and not only the pipeline bound before it. The dispatch checkpoints carry the compute
+// pipeline last bound here, which is why the binds are written by hand. Nothing happens with the checkpoints off.
+static void mark(VkCommandBuffer cb, const char *kind) {
+    if (vk_checkpoints_on()) rec_checkpoint(cb, vk_checkpoint_tag(kind));
+}
+
+typedef struct { VkPipelineBindPoint bp; VkPipeline p; } A_BindPipeline;
+void rc_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
+    if (bp == VK_PIPELINE_BIND_POINT_COMPUTE && vk_checkpoints_on()) vk_checkpoint_compute(p);
+    if (!OWNED(cb)) { vkCmdBindPipeline(cb, bp, p); return; }
+    A_BindPipeline *a = put(R_BindPipeline, sizeof *a);
+    *a = (A_BindPipeline){bp, p};
+    pub();
+}
+typedef struct { uint32_t x, y, z; } A_Dispatch;
+void rc_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    mark(cb, "dispatch");
+    if (!OWNED(cb)) { vkCmdDispatch(cb, x, y, z); return; }
+    A_Dispatch *a = put(R_Dispatch, sizeof *a);
+    *a = (A_Dispatch){x, y, z};
+    pub();
+}
+typedef struct { VkBuffer b; VkDeviceSize o; } A_DispatchIndirect;
+void rc_vkCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o) {
+    mark(cb, "dispatch indirect");
+    if (!OWNED(cb)) { vkCmdDispatchIndirect(cb, b, o); return; }
+    A_DispatchIndirect *a = put(R_DispatchIndirect, sizeof *a);
+    *a = (A_DispatchIndirect){b, o};
+    pub();
+}
 #define PACK_Draw *a = (A_Draw){n, i, f, fi}
 FIXED(Draw, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, uint32_t fi), (cb, n, i, f, fi), uint32_t n, i, f, fi)
 #define PACK_DrawIndexed *a = (A_DrawIndexed){n, i, f, v, fi}
@@ -345,6 +392,7 @@ void rc_vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t n, 
 typedef struct { VkImage s; VkImageLayout sl; VkImage d; VkImageLayout dl; uint32_t n; const void *r; VkFilter f; } A_Img;
 #define IMG_CMD(name, rtype, params, call, ...)                                                                         \
     void rc_vkCmd##name params {                                                                                       \
+        mark(cb, #name);                                                                                                \
         if (!OWNED(cb)) { vkCmd##name call; return; }                                                                  \
         A_Img *a = put(R_##name, sizeof *a + sizeof(rtype) * n);                                                       \
         uint8_t *at = (uint8_t *)(a + 1);                                                                              \
@@ -362,6 +410,7 @@ IMG_CMD(ResolveImage, VkImageResolve, (VkCommandBuffer cb, VkImage s, VkImageLay
 typedef struct { uint64_t s, d; VkImageLayout l; uint32_t n; const void *r; } A_Xfer;   // buffer or image handles
 #define XFER_CMD(name, rtype, params, call, S, D, L)                                                                    \
     void rc_vkCmd##name params {                                                                                       \
+        mark(cb, #name);                                                                                                \
         if (!OWNED(cb)) { vkCmd##name call; return; }                                                                  \
         A_Xfer *a = put(R_##name, sizeof *a + sizeof(rtype) * n);                                                      \
         uint8_t *at = (uint8_t *)(a + 1);                                                                              \
@@ -390,6 +439,7 @@ typedef struct { VkImage i; VkImageLayout l; union { VkClearColorValue c; VkClea
                  const VkImageSubresourceRange *r; } A_ClearImage;
 void rc_vkCmdClearColorImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearColorValue *c, uint32_t n,
                              const VkImageSubresourceRange *r) {
+    mark(cb, "ClearColorImage");
     if (!OWNED(cb)) { vkCmdClearColorImage(cb, i, l, c, n, r); return; }
     A_ClearImage *a = put(R_ClearColorImage, sizeof *a + sizeof *r * n);
     uint8_t *at = (uint8_t *)(a + 1);
@@ -458,6 +508,14 @@ void rec_crumb(VkCommandBuffer cb, int kind, uint64_t n) {
     if (!OWNED(cb)) { vk_crumb(cb, kind, n); return; }
     A_Crumb *a = put(R_Crumb, sizeof *a);
     *a = (A_Crumb){kind, n};
+    pub();
+}
+
+typedef struct { const void *marker; } A_Checkpoint;
+void rec_checkpoint(VkCommandBuffer cb, const void *marker) {
+    if (!OWNED(cb)) { vk_checkpoint(cb, marker); return; }
+    A_Checkpoint *a = put(R_Checkpoint, sizeof *a);
+    a->marker = marker;
     pub();
 }
 
@@ -617,6 +675,7 @@ static void exec_packet(uint32_t op, void *p) {
     case R_BlendEnable: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEnableEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_BlendEquation: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEquationEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_WriteMask: { A_Targets *a = p; ((PFN_vkCmdSetColorWriteMaskEXT)a->fn)(cb, a->first, a->n, a->v); break; }
+    case R_Checkpoint: { A_Checkpoint *a = p; vk_checkpoint(cb, a->marker); break; }
     case R_Crumb: { A_Crumb *a = p; vk_crumb(cb, a->kind, a->n); break; }
     case R_EndCb: {
         A_EndCb *a = p;

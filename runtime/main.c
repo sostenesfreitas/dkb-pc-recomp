@@ -107,13 +107,14 @@ static void log_open(int game) {
     if (cut && (size_t)(cut - dir) + sizeof "/logs" <= sizeof dir) {
         strcpy(cut, "/logs");
         plat_file_mkdir_p(dir);
+        const char *base = rt_game_version ? "totk" : "dkb";   // Bananza logs to dkb.log, TotK to totk.log
         for (int i = LOG_KEEP - 1; i > 0; i--) {   // totk.3.log -> totk.4.log, ..., totk.log -> totk.1.log
-            if (i > 1) snprintf(from, sizeof from, "%s/totk.%d.log", dir, i - 1);
-            else snprintf(from, sizeof from, "%s/totk.log", dir);
-            snprintf(to, sizeof to, "%s/totk.%d.log", dir, i);
+            if (i > 1) snprintf(from, sizeof from, "%s/%s.%d.log", dir, base, i - 1);
+            else snprintf(from, sizeof from, "%s/%s.log", dir, base);
+            snprintf(to, sizeof to, "%s/%s.%d.log", dir, base, i);
             if (plat_file_exists(from)) plat_file_replace(from, to);
         }
-        snprintf(g_log_path, sizeof g_log_path, "%s/totk.log", dir);
+        snprintf(g_log_path, sizeof g_log_path, "%s/%s.log", dir, base);
         g_log_file = plat_append_open(g_log_path);
     }
     if (!g_log_file) {
@@ -125,6 +126,7 @@ static void log_open(int game) {
     plat_append_write(g_log_file, g_log_early, n);
     g_log_bytes = n;
     __atomic_store_n(&g_log_state, LOG_FILE, __ATOMIC_RELEASE);
+    rt_log("version: %s (%s)", rt_port_version, rt_game_version ? "TotK" : "Bananza 1.0.0");
     rt_log("log: %s", g_log_path);
 }
 
@@ -441,7 +443,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-shader-geometry | --probe-vkmem | "
-                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --translate-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -507,6 +509,12 @@ int main(int argc, char **argv) {
             double s = strtod(argv[i], &end);
             if (*end || !(s > 0) || s > 1e6) return usage(argv[0]);
             cfg.seconds = s;
+        } else if (!strcmp(argv[i], "--version")) {
+            // The port version (VERSION, plus the commit of a checkout) and the game it was built for, so a report says
+            // which build it came from.
+            printf("%s %s (%s)\n", rt_game_version ? "totk" : "dkb", rt_port_version,
+                   rt_game_version ? "Tears of the Kingdom" : "Donkey Kong Bananza 1.0.0");
+            return 0;
         } else if (!strcmp(argv[i], "--shot")) {
             if (++i == argc) return usage(argv[0]);
             cfg.shot = argv[i];
@@ -554,6 +562,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
+    if (!strcmp(mode, "--translate-shaders")) return vk_pipeline_translate_shaders();
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);

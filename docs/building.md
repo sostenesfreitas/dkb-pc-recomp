@@ -154,6 +154,22 @@ Requirements:
   Vulkan Memory Allocator is a single header (AUR `vulkan-memory-allocator`). Without it, `build_game.py` fetches the
   version the Windows release pins (3.4.0) into `toolchain/vma/` on first use and checks its hash.
 
+- Packages on Fedora 44 (verified by building Bananza 1.0.0 in a Fedora 44 toolbx container):
+
+  ```sh
+  sudo dnf install --skip-unavailable clang lld ninja-build make SDL3-devel opus-devel libvpx-devel \
+      libzstd-devel vulkan-headers vulkan-loader-devel vulkan-validation-layers vulkan-tools spirv-tools \
+      libstdc++-static dotnet-sdk-10.0 uv git
+  ```
+
+  `libstdc++-static` is the easy one to miss: the Linux link line carries `-l:libstdc++.a`, and Fedora's
+  `libstdc++` package ships only the 32-bit static library, so without it the link stops at
+  `unable to find library -l:libstdc++.a`. VMA is the same story as on Arch. Fedora 44 ships no Python 3.12,
+  so `uv python install 3.12` comes before `uv venv --python 3.12 .venv` in the step above.
+
+  NativeAOT needs nothing extra there: `dotnet publish -r linux-x64 -p:PublishAot=true` finds the system
+  `clang` and `lld` and links the shader translator without `--llvm` or `--sysroot`.
+
 The steps are the Windows ones with POSIX paths: `.venv/bin/python` in place of `.venv\Scripts\python`, and `totk` in
 place of `totk.exe`. `build_game.py` takes clang, lld and Ninja from PATH (or the ones in `<dir>/bin` with
 `--toolchain <dir>`) and links against the system libraries, with `libstdc++` static and an `$ORIGIN` rpath;

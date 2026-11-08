@@ -393,6 +393,18 @@ static void overlay_init(void) {
     int wide = 0;
     unsigned out[2];
     res_wanted(out);
+    // Bananza's edge HUD is a complete overlay, selected at boot just like the
+    // centered layout. Fall back to the centered overlay when it is not installed.
+    if (!patches && !rt_game_version && res_wants_wide_overlay(out) &&
+        !strcmp(cfg_value("TOTK_HUD_POSITION"), "edges")) {
+        if (snprintf(def, sizeof def, "%s/romfs-patches-%ux%u-hud-edges/manifest.tsv", index_dir, out[0], out[1]) <
+                (int)sizeof def && plat_file_exists(def)) {
+            def[strlen(def) - strlen("/manifest.tsv")] = 0;
+            patches = def, wide = 1;
+        } else {
+            rt_log("RomFS overlay: edge HUD layout missing for %ux%u; using the centered layout", out[0], out[1]);
+        }
+    }
     if (!patches && res_wants_wide_overlay(out)) {
         if (snprintf(def, sizeof def, "%s/romfs-patches-%ux%u/manifest.tsv", index_dir, out[0], out[1]) < (int)sizeof def &&
             plat_file_exists(def)) {
@@ -400,7 +412,8 @@ static void overlay_init(void) {
             patches = def, wide = 1;
         } else {
             rt_log("RomFS overlay: no romfs-patches-%ux%u for this game resolution, the UI keeps its 16:9 layout "
-                   "(tools/make_romfs_patches.py --aspect %ux%u)", out[0], out[1], out[0], out[1]);
+                   "(tools/%s --aspect %ux%u)", out[0], out[1],
+                   rt_game_version ? "make_romfs_patches.py" : "dkb_wide_layout.py", out[0], out[1]);
         }
     }
     xbox_prompts_ready =

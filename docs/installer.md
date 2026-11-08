@@ -52,12 +52,18 @@ The Bananza steps are:
    stop the build. `subsdk0` is not generated.
 5. Build `dkb100` from the current runtime sources with `tools/build_game.py`, without `--runtime-lib`, then copy the
    executable, runtime libraries and RomFS index into place. The default worker limit is six; `--jobs` changes it.
-6. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
+6. Translate the game's shaders: `tools/dkb_shader_census.py` lists the shader stages in the packed RomFS into
+   `seed-nvn2.bin`, `dkb.exe --translate-shaders` lowers and translates them into the shader cache beside the executable
+   (a few minutes, about 3 GB), and the pack is deleted. Without this step the first visit to each area waits for its
+   shaders. Then `dkb.exe --warm-shaders` builds the driver's pipeline libraries; if that fails or the driver crashes
+   (seen in `nvgpucomp64.dll` on NVIDIA 621.01) the installer warns and goes on, records `libraries: false` and does not
+   retry, since the libraries only speed up the first draws. A translation failure fails the step.
+7. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
    remove only owned staging/build directories. Logs remain in the temporary folder. Setup does not start the game.
 
 The portable output contains `dkb.exe`, its runtime DLLs, `totk_xlate.exe` and `.id`, `exefs/`, packed `romfs/`,
-`romfs-index.bin`, `totk.ini` and `dkb-install.json`. The inherited `totk.ini` name is intentional: the runtime reads
-it. Saves and shader caches are created beside the executable when it runs. Source dumps stay untouched.
+`romfs-index.bin`, `totk.ini`, `dkb-install.json` and the `shader-cache/` folder of step 6. The inherited `totk.ini` name is
+intentional: the runtime reads it. Saves and further shader caches are created beside the executable when it runs. Source dumps stay untouched.
 
 Only an empty destination or a Bananza install with matching ownership metadata is accepted. Temporary work has its
 own ownership marker; an unrelated nonempty temporary directory is refused. OS-held locks prevent simultaneous
@@ -191,12 +197,21 @@ THIRD_PARTY_NOTICES.md
 totk.ini.example, VERSION  the default ini; the release string (the repository's VERSION plus the commit)
 ```
 
+`make_release.py --game dkb` makes the Bananza folder (`DKB-Setup-<version>-windows.zip` with `--zip`) from the
+same layout, with these differences: the launcher is `DKB-Setup.exe` (its two messages are the `dkb.launcher.*` ids);
+`runtime/` holds every runtime source instead of `libtotkrt.a`, because the installer compiles the whole runtime at
+install time; `bin/` has no `hactool.exe` (Bananza reads plain ExeFS and RomFS folders); `tools/` adds
+`build_xlate.py`, `dkb_pack_romfs.py`, `dkb_shader_census.py`, `vendor/ryujinx` and `xlate` (the translator is built
+at install); the lifted tree is `dkb100` instead of `v121`/`v143`.
+
 - SDL3 comes from the upstream release, not MSYS2: MSYS2's DLL imports the LGPL libiconv.
 - Every bundled third-party piece gets a row in `THIRD_PARTY_NOTICES.md`.
 - The release contains nothing game-derived; `make_release.py` runs `tools/check_content.py` over the folder before it
   finishes.
 
 ## Linux release
+
+TotK only. There is no Linux release of Bananza yet; its release is the Windows `DKB-Setup-<version>-windows.zip`.
 
 `tools/make_release_linux.py` builds the same setup for Linux and packs it as `TotK-Setup-x86_64.AppImage` (the static
 type-2 runtime: no libfuse2 needed on the host). The player makes it executable and starts it; on a Steam Deck, from

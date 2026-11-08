@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "cfg.h"
 #include "host.h"
@@ -64,7 +65,21 @@ static int create_instance(void) {
         rt_log("vk: TOTK_VK_VALIDATION set but %s is not installed; continuing without", layers[0]);
         validate = 0;
     }
-    if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    // The checkpoints also want debug utils, for the device address binding messenger (vk_crumbs.c).
+    int utils = validate;
+    const char *ck = cfg_get("TOTK_GPU_CHECKPOINTS");
+    if (!utils && ck && !strcmp(ck, "1")) {
+        uint32_t ni = 0;
+        vkEnumerateInstanceExtensionProperties(NULL, &ni, NULL);
+        VkExtensionProperties *ip = calloc(ni ? ni : 1, sizeof *ip);
+        if (ip) {
+            vkEnumerateInstanceExtensionProperties(NULL, &ni, ip);
+            utils = has_ext(ip, ni, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            free(ip);
+        } else utils = 0;
+    }
+    if (utils) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    g_vk.debug_utils = utils;
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
                              .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
@@ -202,6 +217,8 @@ typedef struct {
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pei;
 } FeatureChain;
 
 static int create_device(void) {
@@ -249,6 +266,23 @@ static int create_device(void) {
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
     // GPU breadcrumbs for a lost device (vk_crumbs.c): AMD's drivers and RADV report it.
     if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
+    // NVIDIA's counterpart, opt-in because every pipeline bind then carries a checkpoint command.
+    {
+        const char *e = cfg_get("TOTK_GPU_CHECKPOINTS");
+        if (e && !strcmp(e, "1") && has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+            g_vk.has_nv_checkpoints = 1;
+            ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
+            // Which VAs the driver maps and unmaps, to name the memory a fault address falls in (vk_crumbs.c).
+            if (g_vk.debug_utils && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+                g_vk.has_address_binding_report = 1;
+                ext[n_ext++] = VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME;
+                CHAIN(abr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT);
+            }
+            // The driver's compiled code size and ISA per pipeline, to map a faulting shader binary to our stages.
+            OPTIONAL_EXT(has_pipeline_exec_info, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, pei,
+                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
+        }
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -285,6 +319,8 @@ static int create_device(void) {
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+    if (g_vk.has_address_binding_report && !c->abr.reportAddressBinding) g_vk.has_address_binding_report = 0;
+    if (g_vk.has_pipeline_exec_info && !c->pei.pipelineExecutableInfo) g_vk.has_pipeline_exec_info = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
@@ -434,8 +470,32 @@ void vk_device_fault_report(VkResult r) {
     VkDeviceFaultVendorInfoEXT *vi = calloc(n.vendorInfoCount + 1, sizeof *vi);
     VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = ai, .pVendorInfos = vi};
     uint64_t binary = n.vendorBinarySize;
-    n.vendorBinarySize = 0;   // the vendor binary is not fetched; its size alone is logged
+    // The vendor binary is fetched only under DKB_GPU_CHECKPOINTS=1 and within a sane size; otherwise its size alone is
+    // logged. Per the spec the first call returns sizes and the second fills the data pointers.
+    void *bin = NULL;
+    if (vk_checkpoints_on() && binary > 0 && binary <= (64ull << 20)) bin = malloc((size_t)binary);
+    n.vendorBinarySize = bin ? binary : 0;
+    info.pVendorBinaryData = bin;
     if (q == VK_SUCCESS && ai && vi) q = get(c->device, &n, &info);
+    if (bin && (q == VK_SUCCESS || q == VK_INCOMPLETE)) {
+        // Best effort: any failure here is a log line only. The dump can hold derived shader code, so it stays in the
+        // local logs folder next to dkb.log and is never attached to reports.
+        const VkDeviceFaultVendorBinaryHeaderVersionOneEXT *h = bin;
+        if (n.vendorBinarySize >= sizeof *h)
+            rt_log("vk: device fault binary header: vendor %#x device %#x driver %#x app name offset %u app version %#x "
+                   "engine version %#x api version %#x", h->vendorID, h->deviceID, h->driverVersion, h->applicationNameOffset,
+                   h->applicationVersion, h->engineVersion, h->apiVersion);
+        const char *lp = rt_log_path();
+        char path[PLAT_PATH_MAX * 3 + 48];
+        const char *cut = lp ? strrchr(lp, '/') : NULL;
+        if (cut) {
+            snprintf(path, sizeof path, "%.*s/dkb-fault-%llu.bin", (int)(cut - lp), lp, (unsigned long long)time(NULL));
+            if (plat_file_write_atomic(path, bin, (size_t)n.vendorBinarySize))
+                rt_log("vk: device fault binary saved: %s (%llu bytes)", path, (unsigned long long)n.vendorBinarySize);
+            else rt_log("vk: device fault binary: cannot write %s", path);
+        } else rt_log("vk: device fault binary not saved (no log file)");
+    }
+    free(bin);
     if (q != VK_SUCCESS && q != VK_INCOMPLETE) {
         rt_log("vk: device lost; vkGetDeviceFaultInfoEXT failed (%d)", (int)q);
     } else {
@@ -443,8 +503,11 @@ void vk_device_fault_report(VkResult r) {
                n.addressInfoCount, n.vendorInfoCount, (unsigned long long)binary);
         // The faulting access lies in the precision-aligned range around the reported address.
         for (uint32_t i = 0; i < n.addressInfoCount; i++)
+        {
             rt_log("vk: device fault address %u: %s at %#llx, precision %#llx", i, fault_address_type(ai[i].addressType),
                    (unsigned long long)ai[i].reportedAddress, (unsigned long long)ai[i].addressPrecision);
+            vk_crumbs_report_address(ai[i].reportedAddress);
+        }
         for (uint32_t i = 0; i < n.vendorInfoCount; i++)
             rt_log("vk: device fault vendor info %u: \"%s\" code %#llx data %#llx", i, vi[i].description,
                    (unsigned long long)vi[i].vendorFaultCode, (unsigned long long)vi[i].vendorFaultData);

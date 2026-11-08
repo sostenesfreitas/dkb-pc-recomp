@@ -33,6 +33,10 @@ typedef struct VkCtx {
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
+        has_nv_checkpoints,                 // VK_NV_device_diagnostic_checkpoints enabled (DKB_GPU_CHECKPOINTS=1)
+        has_address_binding_report,         // VK_EXT_device_address_binding_report enabled (with the checkpoints, vk_crumbs.c)
+        has_pipeline_exec_info,             // VK_KHR_pipeline_executable_properties enabled (with the checkpoints, vk_crumbs.c)
+        debug_utils,                       // VK_EXT_debug_utils enabled on the instance (validation or the checkpoints)
         has_astc_ldr;                       // textureCompressionASTC_LDR (enabled when reported)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
@@ -83,7 +87,23 @@ void vk_crumbs_release(void);
 // Records crumb kind with number n (a timeline value, a batch number; the low 28 bits are kept) into cb. Only the
 // thread that records cb may call it: never into a replay part while the recorder thread owns it (vk_rec.h).
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n);
-void vk_crumbs_report(void);         // logs the two codes and what they name
+void vk_crumbs_report(void);         // logs the two codes and what they name, and the NVIDIA checkpoints
+// NVIDIA: with DKB_GPU_CHECKPOINTS=1 and VK_NV_device_diagnostic_checkpoints, vk_checkpoint puts marker into cb (same
+// thread rule as vk_crumb; rec_checkpoint in vk_rec.h for replay parts) and vk_checkpoint_note tells the report which
+// NVN 2 stage names (vertex or compute, geometry, fragment; 0 unknown) the VkPipeline marker holds. All no-ops when off.
+int vk_checkpoints_on(void);
+void vk_checkpoint(VkCommandBuffer cb, const void *marker);
+void vk_checkpoint_note(VkPipeline p, uint64_t vs, uint64_t gs, uint64_t fs);
+// Flags for every graphics pipeline create (and library) so vk_checkpoint_note can log the driver's executables
+// (statistics, ISA) the first time it sees a pipeline; 0 unless the checkpoints and VK_KHR_pipeline_executable_properties are on.
+VkPipelineCreateFlags vk_pipeline_capture_flags(void);
+// Marker for a non-pipeline checkpoint (rec_checkpoint): kind names the command ("dispatch", "copy buffer", ...; a
+// string literal) and, for a dispatch, the compute pipeline last bound by vk_checkpoint_compute on this thread.
+const void *vk_checkpoint_tag(const char *kind);
+void vk_checkpoint_compute(VkPipeline p);
+// With the checkpoints on and VK_EXT_device_address_binding_report: the report also maps each faulting address to the
+// device-address bindings seen so far (vk_crumbs.c). Called by vk_device_fault_report for every address it prints.
+void vk_crumbs_report_address(uint64_t address);
 
 // ---- window and present (gfx_present.c). Host threads only.
 // vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled

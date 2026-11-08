@@ -2,7 +2,8 @@
 
 > [!NOTE]
 > This page comes from TotK Recomp. DKB Recomp uses the same input code, so it applies to Bananza too; setting and file
-> names still carry the `TOTK_` and `totk` prefixes.
+> names are written below with the TotK Recomp names. In the Bananza build read `TOTK_*` as `DKB_*` (both work, `DKB_`
+> wins) and `totk.ini` as `dkb.ini` (a `totk.ini` is copied to it on the first run).
 
 Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into one Switch controller (`runtime/input_win.c`). Buttons are ORed; each stick takes the source with the larger deflection. Keys and mouse buttons count only while the game window is in the foreground. `TOTK_INPUT=none` disables both (automated runs). `TOTK_*` settings can also be set in `totk.ini` next to `totk.exe` (`input = none`, `motion = 0`, `rumble = 0`); the environment overrides the file. `TOTK_RUMBLE_STRENGTH` is the rumble strength in percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `TOTK_RUMBLE_CURVE` is the exponent applied to the amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear). `TOTK_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
 
@@ -82,7 +83,9 @@ bind_Y = pad:north, key:mouse_l
 
 ## Mouse camera
 
-Mouse motion (raw input) becomes right-stick deflection. Each presented frame takes the counts moved since the last frame, divides by the frame time and sets the deflection to `counts per second * TOTK_MOUSE_SENS / 3000` of full, held for that frame, so the turn rate does not depend on the frame rate. This is not mouselook: the game's stick curve and dead zone still apply, so very slow movements do nothing and a fast flick saturates. The mouse deflection competes with the gamepad and arrow keys by the larger-deflection rule.
+Enable **Direct mouse camera** in F1 > Controls to use raw mouse distance for rotation in Bananza 1.0.0's normal ground-follow camera: each count turns `0.064 * TOTK_MOUSE_SENS` degrees. It is off by default. The toggle and sensitivity apply live. This bypasses the stick's dead zone, acceleration and smoothing, so small movements register and fast turns are not capped at full-stick speed. The game's camera inversion settings and vertical limits still apply, and the native camera handles its orbit and collision. Vertical mouse movement can interrupt the native pitch-adjustment waiting states, just as stick input does. Controller and arrow-key input retain the game's normal behavior when the mouse is idle.
+
+Other camera modes use the existing mouse-to-stick fallback. Each presented frame converts raw counts into `counts per second * TOTK_MOUSE_SENS / 3000` of full stick deflection, held for that frame. In that path the game's stick curve and dead zone still apply, and the larger deflection wins between mouse, controller and arrow keys. Aiming and special transformations still need gameplay validation. The setting is stored as `mouse_camera` in `totk.ini`; `DKB_MOUSE_CAMERA=0|1` overrides it. Direct rotation requires regenerating the game code with `recomp/patches-dkb100.txt`.
 
 `TOTK_MOUSE_SENS` (0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `TOTK_INPUT=none` disables the capture too.
 

@@ -155,7 +155,7 @@ if __name__ == '__main__':
                         error_details=[{'test': str(test), 'traceback': text} for test, text in result.errors],
                         sources={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in (
                             'tests/geometry_viewport_fixture.py', 'tests/geometry_viewport_state_test.py',
-                            'tools/xlate/patches/0017-native-geometry-passthrough-viewport-mask.patch')},
+                            'tools/xlate/patches/0018-native-geometry-passthrough-viewport-mask.patch')},
                         gpu_executed=False,
                         limits='Authored acyclic scalar SPIR-V only; SSBO store/input leaf checks, not general Output/Private/Function store bounds, hardware viewport or Vulkan memory semantics.')
         (args.out / 'result.json').write_text(json.dumps(evidence, indent=2) + '\n', encoding='utf-8')

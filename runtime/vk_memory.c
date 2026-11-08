@@ -120,9 +120,32 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->import_hi = (addr + size + al - 1) & ~(al - 1);
     uint64_t n = r->import_hi - r->import_lo;
     VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-    VkResult res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-                                               (void *)(uintptr_t)r->import_lo, &hp)
-                                : VK_ERROR_EXTENSION_NOT_PRESENT;
+    // The Vulkan spec ties the memory types to the pointer given, but every guest pool here is plain committed
+    // read/write memory (platform/win32.c plat_mem_reserve/plat_mem_commit: no write-combined, uncached or file-view
+    // pages), so the answer is assumed to be the same for all of them. NVIDIA's driver took long in this query for the big guest pools of a level change (five guest threads in turn, 1.8 s in a TOTK_PROFILE_SLOW dump:
+    // the callq before dkb.exe+9331ce7 is this call, handle type 0x80). The first answer is kept for the other pools;
+    // TOTK_HOST_PROPS_CACHE=0 asks every time. A type that would not do fails in vkAllocateMemory below, like before.
+    static volatile uint32_t host_bits;
+    static int cache_on = -1;
+    static int32_t n_slow_props;
+    if (cache_on < 0) {
+        const char *e = cfg_get("TOTK_HOST_PROPS_CACHE");
+        cache_on = !(e && !strcmp(e, "0"));
+    }
+    VkResult res;
+    uint32_t known = cache_on ? __atomic_load_n(&host_bits, __ATOMIC_ACQUIRE) : 0;
+    if (known) {
+        hp.memoryTypeBits = known, res = VK_SUCCESS;
+    } else {
+        uint64_t t0 = qpc();
+        res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                          (void *)(uintptr_t)r->import_lo, &hp)
+                           : VK_ERROR_EXTENSION_NOT_PRESENT;
+        double ms = (double)(qpc() - t0) / 1e6;
+        if (ms > 10.0 && plat_inc32(&n_slow_props) <= 16)
+            rt_log("vk: vkGetMemoryHostPointerPropertiesEXT of %llu MiB took %.1f ms", (unsigned long long)(n >> 20), ms);
+        if (res == VK_SUCCESS && hp.memoryTypeBits && cache_on) __atomic_store_n(&host_bits, hp.memoryTypeBits, __ATOMIC_RELEASE);
+    }
     if (res != VK_SUCCESS || !hp.memoryTypeBits) {
         rt_log("vk: pool %#llx+%#llx: host pointer not importable (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         return 0;
@@ -152,8 +175,26 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
                                .memoryTypeIndex = (uint32_t)type};
-    if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
-        (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
+    static int32_t n_slow_alloc;
+    uint64_t ta = qpc();
+    res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
+    if (res != VK_SUCCESS && known && p_host_props) {
+        r->mem = VK_NULL_HANDLE;
+        VkMemoryHostPointerPropertiesEXT hp2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        int t2 = -1;
+        if (p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)(uintptr_t)r->import_lo, &hp2) == VK_SUCCESS)
+            t2 = memory_type(c, req.memoryTypeBits & hp2.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (t2 >= 0) {
+            ai.memoryTypeIndex = (uint32_t)t2;
+            res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
+        }
+    }
+    if (res != VK_SUCCESS) r->mem = VK_NULL_HANDLE;
+    double alloc_ms = (double)(qpc() - ta) / 1e6;
+    if (alloc_ms > 10.0 && plat_inc32(&n_slow_alloc) <= 32)
+        rt_log("vk: importing %llu MiB of guest memory took %.1f ms in vkAllocateMemory", (unsigned long long)(n >> 20), alloc_ms);
+    if (res != VK_SUCCESS || (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
         vkDestroyBuffer(c->device, r->buf, NULL);
@@ -299,6 +340,44 @@ int vk_pool_init(pool_t *p) {
     return 1;
 }
 
+// What the release of a used pool waits for before the guest gets its storage back. TOTK_POOL_FINI_WAIT=idle (the
+// default) is the whole graphics queue idle, with the queue lock held, which costs a driver round trip per pool even when
+// the GPU has nothing left: a level change frees many pools one after another (a 1.6 s frame in a TOTK_PROFILE_SLOW dump,
+// five guest threads in turn inside this wait). fence waits for the timeline value of the newest finished submission
+// instead and does not enter the driver when that value is already done. It covers the work the game has synchronized
+// on, which is what a release is allowed to follow; it does not cover the parts that vk_sync_split already submitted
+// for the submission still being recorded (they signal only at its end), which the idle wait did.
+static void pool_fini_wait(VkCtx *c) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = cfg_get("TOTK_POOL_FINI_WAIT");
+        mode = e && !strcmp(e, "fence");
+        if (mode) rt_log("vk: a pool release waits for the newest submission on the timeline (TOTK_POOL_FINI_WAIT=fence)");
+        else if (e && *e && strcmp(e, "idle")) rt_log("vk: TOTK_POOL_FINI_WAIT=%s is not idle or fence: waiting for the queue to idle", e);
+    }
+    if (mode) {
+        uint64_t v = vk_sync_issued();
+        if (v && vk_sync_fence_done() < v) vk_sync_fence_wait(v, UINT64_MAX);
+        return;
+    }
+    vk_queue_lock();
+    vkQueueWaitIdle(c->gfx_queue);
+    vk_queue_unlock();
+}
+
+// Releases of used pools that waited over 10 ms are logged (the first 64 of them), with the running total of all waits.
+static volatile int32_t pf_slow;
+static volatile uint64_t pf_flush_ns, pf_wait_ns;
+static void pool_fini_note(uint64_t size, uint64_t flush_ns, uint64_t wait_ns) {
+    __atomic_add_fetch(&pf_flush_ns, flush_ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pf_wait_ns, wait_ns, __ATOMIC_RELAXED);
+    if (flush_ns + wait_ns <= 10000000ull) return;
+    long n = plat_inc32(&pf_slow);
+    if (n <= 64)
+        rt_log("vk: used pool of %llu MiB released: upload flush %.1f ms, wait for the GPU %.1f ms (slow release %ld; %.0f ms in all releases so far)",
+               (unsigned long long)(size >> 20), flush_ns / 1e6, wait_ns / 1e6, n, (pf_flush_ns + pf_wait_ns) / 1e6);
+}
+
 void vk_pool_fini(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) return;
@@ -330,10 +409,11 @@ void vk_pool_fini(pool_t *p) {
     // guest gets the storage back when this returns.
     vk_texture_range_gone(r->lo, r->size, r->alloc);
     if (r->used && r->kind != POOL_VIRT) {
+        uint64_t t0 = qpc();
         vk_upload_flush(1);
-        vk_queue_lock();
-        vkQueueWaitIdle(c->gfx_queue);
-        vk_queue_unlock();
+        uint64_t t1 = qpc();
+        pool_fini_wait(c);
+        pool_fini_note(r->size, t1 - t0, qpc() - t1);
     }
     vk_mem_collect();
     // A mirrored pool's record and buffers outlive the submission being recorded, whose sync copies and write-backs may
@@ -944,6 +1024,8 @@ static PoolRec **stouch;                          // shadow_lock: pools resolved
 static int nstouch, cstouch;
 static SRange *spend;                             // shadow_lock: GPU writes recorded and not copied back yet
 static int nspend, cspend;
+static SRange *sblocked;                          // shadow_lock: sorted union of spend, rebuilt when it changes
+static int nsblocked, csblocked, spend_dirty;
 static int64_t s_live_n, s_live_bytes;            // shadow_lock
 static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_ticks;   // shadow_lock: since the last log
 
@@ -996,17 +1078,51 @@ static void shadow_forget(PoolRec *r) {
     plat_mutex_unlock(&shadow_lock);
 }
 
-// shadow_lock held: copies guest [a, b) into the shadow, leaving out the bytes of GPU writes not copied back yet
-// (spend from index i on).
-static void shadow_copy(PoolRec *r, uint64_t a, uint64_t b, int i) {
-    for (; i < nspend; i++)
-        if (spend[i].lo < b && spend[i].hi > a) {
-            if (spend[i].lo > a) shadow_copy(r, a, spend[i].lo, i + 1);
-            if (spend[i].hi < b) shadow_copy(r, spend[i].hi, b, i + 1);
-            return;
+static int shadow_range_cmp(const void *x, const void *y) {
+    const SRange *a = x, *b = y;
+    return a->lo < b->lo ? -1 : a->lo > b->lo ? 1 : a->hi < b->hi ? -1 : a->hi > b->hi;
+}
+
+// shadow_lock held: the writeback list changes independently of the CPU's dirty-page queries. Build its union once
+// per change, so each copied range searches by address rather than scanning thousands of pending writes.
+static void shadow_blocked_update(void) {
+    if (!spend_dirty) return;
+    while (csblocked < nspend) grow((void **)&sblocked, &csblocked, sizeof *sblocked);
+    if (nspend) {
+        memcpy(sblocked, spend, (size_t)nspend * sizeof *spend);
+        qsort(sblocked, (size_t)nspend, sizeof *sblocked, shadow_range_cmp);
+    }
+    nsblocked = 0;
+    for (int i = 0; i < nspend; i++) {
+        SRange r = sblocked[i];
+        if (nsblocked && r.lo <= sblocked[nsblocked - 1].hi) {
+            if (r.hi > sblocked[nsblocked - 1].hi) sblocked[nsblocked - 1].hi = r.hi;
+        } else sblocked[nsblocked++] = r;
+    }
+    spend_dirty = 0;
+}
+
+// shadow_lock held: copy guest [a, b) except for bytes a pending GPU write will replace at its fence.
+static void shadow_copy(PoolRec *r, uint64_t a, uint64_t b) {
+    int lo = 0, hi = nsblocked;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (sblocked[mid].hi <= a) lo = mid + 1;
+        else hi = mid;
+    }
+    for (int i = lo; i < nsblocked && sblocked[i].lo < b; i++) {
+        if (sblocked[i].lo > a) {
+            uint64_t end = sblocked[i].lo < b ? sblocked[i].lo : b;
+            memcpy(r->smap + (a - r->import_lo), (const void *)(uintptr_t)a, end - a);
+            s_copied += end - a;
         }
-    memcpy(r->smap + (a - r->import_lo), (const void *)(uintptr_t)a, b - a);
-    s_copied += b - a;
+        if (sblocked[i].hi >= b) return;
+        if (sblocked[i].hi > a) a = sblocked[i].hi;
+    }
+    if (a < b) {
+        memcpy(r->smap + (a - r->import_lo), (const void *)(uintptr_t)a, b - a);
+        s_copied += b - a;
+    }
 }
 
 // shadow_lock and gen_lock held: stamps the pool's written pages and copies those newer than its shadow.
@@ -1027,7 +1143,7 @@ static void shadow_sync_pool(PoolRec *r) {
     r->sgen = gen_now;
     if (!tracked) {   // nothing tells which pages changed: all of them
         s_untracked++;
-        shadow_copy(r, lo, hi, 0);
+        shadow_copy(r, lo, hi);
         return;
     }
     uint64_t run = 0;
@@ -1037,16 +1153,16 @@ static void shadow_sync_pool(PoolRec *r) {
         if (b > hi) b = hi;
         const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (reg_max[k] <= since || !ch) {
-            if (run) shadow_copy(r, run, a, 0), run = 0;
+            if (run) shadow_copy(r, run, a), run = 0;
             continue;
         }
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT) {
             int dirty = ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since;
             if (dirty && !run) run = x;
-            else if (!dirty && run) shadow_copy(r, run, x, 0), run = 0;
+            else if (!dirty && run) shadow_copy(r, run, x), run = 0;
         }
     }
-    if (run) shadow_copy(r, run, hi, 0);
+    if (run) shadow_copy(r, run, hi);
 }
 
 void vk_mem_shadow_sync(void) {
@@ -1054,6 +1170,7 @@ void vk_mem_shadow_sync(void) {
     uint64_t t0 = qpc();
     plat_mutex_lock(&shadow_lock);
     if (nstouch) {
+        shadow_blocked_update();
         plat_mutex_lock(&gen_lock);
         for (int i = 0; i < nstouch; i++) shadow_sync_pool(stouch[i]), stouch[i]->stouched = 0;
         plat_mutex_unlock(&gen_lock);
@@ -1069,6 +1186,7 @@ void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
     plat_mutex_lock(&shadow_lock);
     if (nspend == cspend) grow((void **)&spend, &cspend, sizeof *spend);
     spend[nspend++] = (SRange){addr, addr + size};
+    spend_dirty = 1;
     plat_mutex_unlock(&shadow_lock);
 }
 
@@ -1084,7 +1202,7 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
             s_wb_bytes += size;
         }
         for (int i = 0; i < nspend; i++)
-            if (spend[i].lo == addr && spend[i].hi == addr + size) { spend[i] = spend[--nspend]; break; }
+            if (spend[i].lo == addr && spend[i].hi == addr + size) { spend[i] = spend[--nspend], spend_dirty = 1; break; }
         plat_mutex_unlock(&shadow_lock);
         plat_mutex_unlock_shared(&pool_lock);
     }
@@ -2192,7 +2310,7 @@ void vk_mem_shutdown(void) {
     pool_index.n = 0;
     nm = npend = nwbl = 0;   // mirrors went with their pools
     plat_mutex_lock(&shadow_lock);
-    nstouch = nspend = 0;   // shadows too
+    nstouch = nspend = nsblocked = spend_dirty = 0;   // shadows too
     s_live_n = s_live_bytes = 0;
     plat_mutex_unlock(&shadow_lock);
     for (int i = 0; i < nretiring; i++) destroy_rec(c, retiring[i]);   // finalized ones whose callback never ran

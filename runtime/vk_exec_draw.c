@@ -52,7 +52,7 @@ static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_push = ex->push[1];
 }
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_RESET, W_GEOMETRY, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_SKIP_VS, W_SKIP_FS, W_RESET, W_GEOMETRY, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -90,6 +90,8 @@ typedef struct {
     int npools, cpools;
     Range *written;
     int nwritten, cwritten;
+    uint32_t *written_slot;              // note_written: open-addressed index of written, entry = index + 1, 0 empty
+    uint32_t written_slots;              // a power of two
 } CbRes;
 
 static CbRes *cur;
@@ -205,7 +207,7 @@ static void cb_done(void *arg) {   // completion thread
         plat_mutex_unlock(&spare_lock);
         if (!kept) vmaDestroyBuffer(c->vma, r->chunks[i].buf, r->chunks[i].alloc);
     }
-    free(r->written), free(r->pools), free(r->chunks), free(r);
+    free(r->written), free(r->written_slot), free(r->pools), free(r->chunks), free(r);
 }
 
 void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B); }
@@ -261,12 +263,35 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
     return p;
 }
 
+static uint32_t written_hash(uint64_t addr, uint64_t size) {
+    uint64_t h = (addr ^ size * 0xc2b2ae3d27d4eb4full) * 0x9e3779b97f4a7c15ull;
+    return (uint32_t)(h >> 32);
+}
+
+// Each distinct range once per command buffer, in first-write order. A scene with thousands of written ranges and tens
+// of thousands of draws binding them spent most of the replay searching this list, so the search goes through a table.
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     CbRes *r = cb_res(ex);
-    for (int i = 0; i < r->nwritten; i++)
-        if (r->written[i].addr == addr && r->written[i].size == size) return;
+    if ((uint32_t)r->nwritten * 2 >= r->written_slots) {
+        uint32_t slots = r->written_slots ? r->written_slots * 2 : 256;
+        uint32_t *table = calloc(slots, sizeof *table);
+        if (!table) rt_fatal("vk: out of memory");
+        for (int i = 0; i < r->nwritten; i++) {
+            uint32_t at = written_hash(r->written[i].addr, r->written[i].size) & (slots - 1);
+            while (table[at]) at = (at + 1) & (slots - 1);
+            table[at] = (uint32_t)i + 1;
+        }
+        free(r->written_slot);
+        r->written_slot = table, r->written_slots = slots;
+    }
+    uint32_t mask = r->written_slots - 1, at = written_hash(addr, size) & mask;
+    for (; r->written_slot[at]; at = (at + 1) & mask) {
+        const Range *w = &r->written[r->written_slot[at] - 1];
+        if (w->addr == addr && w->size == size) return;
+    }
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
     r->written[r->nwritten++] = (Range){addr, size};
+    r->written_slot[at] = (uint32_t)r->nwritten;
     vk_mem_gpu_pending(addr, size);
 }
 
@@ -812,11 +837,13 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
     if (locked) vk_texture_unlock();
 }
 
-// DKB_NATIVE_GS=1 runs lowered native passthrough geometry stages through the portable path (issue #45). Off by default.
+// DKB_NATIVE_GS runs lowered native passthrough geometry stages through the portable path (issue #45). On by default
+// (runtime/cfg.c): without it the destructible terrain draws black; DKB_NATIVE_GS=0 turns it off.
 // Eglantine takes the varyings from the hardware skip mask (Maxwell register 0x1240, translate_program.cpp,
 // LowerGeometryPassthrough); the host does not have that mask for NVN 2 programs, so this infers it: what the vertex
-// stage writes and the fragment stage reads. That is enough for a fragment stage that reads nothing, as the terrain's
-// does; a stage whose real mask differs would forward the wrong set.
+// stage writes and the fragment stage reads. On AMD's RDNA 1/2 Windows driver the mine voxel stage is the known
+// exception: its captured hardware mask forwards locations 0 and 19 across both its depth and colour variants. RADV
+// and the other drivers keep the reflected mask.
 static int native_gs_on(void) {
     static int on = -1;
     if (on < 0) on = cfg_bool("TOTK_NATIVE_GS");
@@ -832,7 +859,9 @@ static const uint8_t *native_gs_control(const uint8_t *ctl, const uint8_t *code,
     static size_t count, capacity;
     GfxShaderIo io[32];
     const uint32_t fs_in = gfx_shader_inputs(native_gs_fs, io), vs_out = gfx_shader_outputs(native_gs_vs, io);
-    const uint32_t mask = fs_in & vs_out;
+    uint32_t mask = fs_in & vs_out;
+    if (vk_caps.amd_sc && nvn2_origin(code) == UINT64_C(0x3dbaaf649cb5f927))
+        mask |= (UINT32_C(1) << 0) | (UINT32_C(1) << 19);
     for (size_t i = 0; i < count; i++)
         if (made[i].ctl == ctl && made[i].mask == mask) return made[i].copy;
     uint32_t skip[8];
@@ -2132,6 +2161,16 @@ static void bind_pipeline(VkExec *ex, VkPipelineBindPoint bp, VkPipeline p) {
     int k = bp == VK_PIPELINE_BIND_POINT_COMPUTE;
     if (B.pipe[k] == p) return;
     vkCmdBindPipeline(ex->cb, bp, p);
+    if (vk_ctx()->has_nv_checkpoints && vk_checkpoints_on()) {   // DKB_GPU_CHECKPOINTS=1: name the shaders the checkpoint's pipeline holds
+        uint64_t o[3] = {0};
+        const uint8_t *ctl, *code;
+        uint32_t len;
+        static const int stages[2][3] = {{NVN_STAGE_VS, NVN_STAGE_GS, NVN_STAGE_FS}, {NVN_STAGE_CS, -1, -1}};
+        for (int i = 0; i < 3 && ex->prog; i++)
+            if (stages[k][i] >= 0 && find_stage(ex->prog, stages[k][i], &ctl, &code, &len)) o[i] = nvn2_origin(code);
+        vk_checkpoint_note(p, o[0], o[1], o[2]);
+        rec_checkpoint(ex->cb, p);
+    }
     ex->recorded++;
     B.pipe[k] = p;
     if (!k) B.st_valid = 0;
@@ -2270,42 +2309,6 @@ typedef struct {
 // 782b2585777d2b4e, 392e2956038a9e64 and 7d85669ac430f01a read Location 9, feed every attribute per instance and carry
 // the same integer code (four reads of c9 at a computed index), and skipping every such quad left out ten vertex stages
 // that drew in all 17 logged runs. So it is matched by the name of its NVN 2 stage.
-// LOCAL DIAGNOSTIC, not for a PR. DKB_PAIR_LOG=1 logs each new (vs, fs, gs) stage set at its first draw, to name the
-// draw behind a lost device. DKB_SKIP_STAGE=<hex>[,<hex>] skips the draws that use one of those NVN 2 stages.
-// ponytail: a fixed table and list, enough for one session's stage sets; it stops logging when full.
-static int stage_diag_skip(const VkExec *ex, const GfxShader *vs) {
-    static int on = -1, nskip;
-    static uint64_t skip[16], seen[1 << 16];
-    if (on < 0) {
-        const char *e = getenv("DKB_SKIP_STAGE"), *l = getenv("DKB_PAIR_LOG");
-        for (char *end; e && *e && nskip < 16; e = *end ? end + 1 : end) skip[nskip++] = strtoull(e, &end, 16);
-        on = (l && *l == '1') ? 2 : nskip > 0;
-    }
-    if (!on) return 0;
-    static const int st[3] = {NVN_STAGE_VS, NVN_STAGE_FS, NVN_STAGE_GS};
-    uint64_t o[3] = {0}, h = 1469598103934665603ull;
-    for (int i = 0; i < 3; i++) {
-        const uint8_t *ctl, *code = NULL;
-        uint32_t len;
-        if (find_stage(ex->prog, st[i], &ctl, &code, &len)) o[i] = nvn2_origin(code);
-        h = (h ^ o[i]) * 1099511628211ull;
-        for (int k = 0; k < nskip; k++) if (o[i] && o[i] == skip[k]) return 1;
-    }
-    if (on == 2) {
-        if (!h) h = 1;
-        for (uint32_t i = (uint32_t)h & 0xffff, n = 0; n < 1 << 12; i = (i + 1) & 0xffff, n++) {
-            if (seen[i] == h) break;
-            if (!seen[i]) {
-                seen[i] = h;
-                GfxShaderIo io[32];
-                rt_log("stage set: vs %016llx fs %016llx gs %016llx inputs %08llx", (unsigned long long)o[0], (unsigned long long)o[1], (unsigned long long)o[2], vs ? (unsigned long long)gfx_shader_inputs(vs, io) : 0ull);
-                break;
-            }
-        }
-    }
-    return 0;
-}
-
 static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const GfxShader *fs) {
     static int on = -1;
     if (on < 0) on = !rt_game_version && cfg_bool("TOTK_FIX_VS_FAULT") && vk_ctx()->props.vendorID == 0x10de;   // 0: Bananza
@@ -2323,6 +2326,42 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
     if (!lights || !(gfx_shader_inputs(vs, io) >> 9 & 1)) return 0;
     warn_once(W_FAULT_SKIP, "light-quad draws with ten instance streams are skipped on NVIDIA (#9; TOTK_FIX_VS_FAULT=0 draws them)");
     return 1;
+}
+
+// DKB_SKIP_VS / DKB_SKIP_FS (debug only, for bisecting the device loss of #75): comma-separated 16-digit hex NVN 2
+// stage origins. A draw whose vertex (fragment) stage is listed in the matching variable is skipped, so a run that
+// stops faulting names the culprit shader. Parsed once; unset costs one flag test per draw.
+typedef struct { int n; uint64_t list[16]; } SkipList;
+static int skip_listed(const VkExec *ex, int stage, SkipList *sl, const char *var, int warn, const char *msg) {
+    if (sl->n < 0) {
+        sl->n = 0;
+        const char *e = cfg_get(var);
+        while (e && *e && sl->n < 16) {
+            char *end;
+            uint64_t v = strtoull(e, &end, 16);
+            if (end == e) break;
+            sl->list[sl->n++] = v;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (!sl->n) return 0;
+    const uint8_t *ctl, *code = NULL;
+    uint32_t len;
+    if (!find_stage(ex->prog, stage, &ctl, &code, &len)) return 0;
+    uint64_t o = nvn2_origin(code);
+    for (int i = 0; i < sl->n; i++)
+        if (sl->list[i] == o) return warn_once(warn, msg), 1;
+    return 0;
+}
+
+static int skip_vs_listed(const VkExec *ex) {
+    static SkipList sl = {-1};
+    return skip_listed(ex, NVN_STAGE_VS, &sl, "TOTK_SKIP_VS", W_SKIP_VS, "DKB_SKIP_VS is active: draws of the listed NVN 2 vertex stages are skipped");
+}
+
+static int skip_fs_listed(const VkExec *ex) {
+    static SkipList sl = {-1};
+    return skip_listed(ex, NVN_STAGE_FS, &sl, "TOTK_SKIP_FS", W_SKIP_FS, "DKB_SKIP_FS is active: draws of the listed NVN 2 fragment stages are skipped");
 }
 
 static struct { int on, valid, has_fs, has_gs; MemoKey k; const GfxShader *vs, *fs, *gs; } SM = {-1};
@@ -2538,8 +2577,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         native_gs_vs = vs, native_gs_fs = fs;
         if (gs_wait) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
     }
-    if (stage_diag_skip(ex, vs)) return 0;
-    if (light_quad_fault_skip(ex, vs, fs)) return 0;
+    if (light_quad_fault_skip(ex, vs, fs) || skip_vs_listed(ex) || skip_fs_listed(ex)) return 0;
     if (!vs || (has_fs && !fs) || (want_gs && (!has_gs || !gs))) return 0;
     if (!geometry_feedback_safe(ex, vs, gs)) return 0;
     uint32_t fbl = feedback_prepare(ex, fs);

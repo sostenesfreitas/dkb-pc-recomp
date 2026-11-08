@@ -1,0 +1,50 @@
+// Bananza's virtual display and camera defaults are game state, separate from
+// Vulkan's presentation rectangle. The generated dkbwide sites read this page.
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "cfg.h"
+#include "host.h"
+
+static unsigned wide_output[2] = {2880, 1620};
+static int wide_enabled;
+
+int dkb_wide_output(unsigned out[2]) {
+    if (out) memcpy(out, wide_output, sizeof wide_output);
+    return wide_enabled;
+}
+
+void dkb_wide_init(void) {
+    wide_enabled = 0;
+    wide_output[0] = 2880;
+    wide_output[1] = 1620;
+    int set = rt_patch_set("dkbwide");
+    if (set < 0) return;
+    rt_patch_switch(set, 0);
+    int allow_wide = cfg_bool("TOTK_ULTRAWIDE");
+    unsigned width = 0, height = 0;
+    char tail;
+    const char *value = cfg_value("TOTK_OUTPUT_RES");
+    if (sscanf(value, "%ux%u%c", &width, &height, &tail) != 2 ||
+        width < 1280 || width > 7680 || height < 720 || height > 4320 ||
+        width % 2 || height % 2 || width * 9 < height * 16 ||
+        (!allow_wide && width * 9 != height * 16)) {
+        rt_patch_switch(set, 0);
+        rt_log("Bananza resolution: use an even 16:9 resolution, or enable ultrawide for a wider resolution; using stock 2880x1620");
+        return;
+    }
+    uint8_t *page = rt_patch_page();
+    float aspect = (float)width / height;
+    float factor = aspect / (16.0f / 9.0f);
+    memcpy(page + 0x100, &width, 4);
+    memcpy(page + 0x104, &height, 4);
+    memcpy(page + 0x108, &aspect, 4);
+    memcpy(page + 0x10c, &factor, 4);
+    wide_output[0] = width;
+    wide_output[1] = height;
+    wide_enabled = width * 9 > height * 16;
+    rt_patch_switch(set, 1);
+    rt_log("Bananza resolution: virtual display %ux%u, camera aspect %.6f, ultrawide %s",
+           width, height, aspect, wide_enabled ? "on" : "off");
+}

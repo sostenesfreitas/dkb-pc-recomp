@@ -1,7 +1,7 @@
 # DKB Recomp
 
 > [!WARNING]
-> **Este é um fork pessoal para testes**, baseado em [Lucas-blip-png/dkb-pc-recomp](https://github.com/Lucas-blip-png/dkb-pc-recomp) `6386b42`. A branch `local-prs` junta os PRs #67, #68 e #72, que o projeto ainda não aceitou, e um diagnóstico local. Problemas desta branch não devem ser relatados ao projeto original como se fossem dele.
+> **Este é um fork pessoal para testes**, baseado em [Lucas-blip-png/dkb-pc-recomp](https://github.com/Lucas-blip-png/dkb-pc-recomp) `db77cdf` (branch `bananza`, que já inclui os PRs #67, #68 e #72). A branch `local-prs` acrescenta o instalador e os arquivos de `amigos/`. Problemas desta branch não devem ser relatados ao projeto original como se fossem dele.
 
 ## Como compilar o Donkey Kong Bananza (branch `local-prs`)
 
@@ -256,8 +256,8 @@ The toolchain is TotK Recomp's ([docs/building.md](docs/building.md)): MSYS2 UCR
 .venv\Scripts\python tools\build_game.py --version dkb100 --expected tools\data\expected-dkb100.json --exefs <exefs> --romfs build\extracted\dkb100\romfs
 ```
 
-Everything the build writes stays under `build\` and `generated\`, which git ignores. The game uses about 13 GB of
-RAM, so 16 GB is the minimum for now. Running and testing: [docs/dkb-testing.md](docs/dkb-testing.md).
+Everything the build writes stays under `build\` and `generated\`, which git ignores. The game commits about 14 GB (13.5 GiB at the start and
+13.75 GiB after 40 minutes, rising about 6 MB per minute; longer sessions are untested), so 16 GB of RAM plus a large page file is the minimum for now and 32 GB is comfortable. Running and testing: [docs/dkb-testing.md](docs/dkb-testing.md).
 
 ## FAQ
 
@@ -278,7 +278,13 @@ Recomp keep their MIT terms.
 Recomp, and checked by running the game and the differential tests. AI-assisted pull requests are welcome; you are
 responsible for having read and run them.
 
-## Credits
+## Credits and origin
+
+DKB Recomp is built on [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) (*Tears of the Kingdom*, Switch 1)
+by valentderah and its contributors (MIT, kept in [LICENSE-MIT](LICENSE-MIT)). It uses Eglantine's Ampere shader
+lowering (GPL-3.0-or-later, `runtime/third_party/eglantine/`) and Ryujinx's shader translator (MIT, vendored with
+MacNativeGames' patches), plus the other projects in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The whole is
+under [LICENSE](LICENSE).
 
 - [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) by valentderah, the base of everything here, and the
   projects it builds on: [LAS Recomp](https://github.com/peiikai/LASRecomp),

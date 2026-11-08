@@ -363,6 +363,10 @@ int probe_cfg(void) {
     plat_setenv("TOTK_MOUSE_SENS", NULL);
     plat_setenv("TOTK_FREE_CORES", NULL);
     CHECK(cfg_bool("TOTK_FPS60") == 1, "default: unset FPS60 is on");
+    plat_setenv("TOTK_OUTPUT_RES", NULL);
+    plat_setenv("DKB_OUTPUT_RES", NULL);
+    CHECK(EQ(cfg_value("TOTK_OUTPUT_RES"), rt_game_version ? "1920x1080" : "2880x1620"),
+          "default: preserve the game's stock output resolution");
     CHECK(EQ(cfg_value("TOTK_VK_PRESENT"), "mailbox") && cfg_int("TOTK_SPLIT_DRAWS") == 64, "default: text and integer");
     plat_setenv("TOTK_MOUSE_SENS", "2.5");
     CHECK(cfg_double("TOTK_MOUSE_SENS") == 2.5, "double: the environment value");
@@ -379,6 +383,17 @@ int probe_cfg(void) {
     plat_setenv("TOTK_FREE_CORES", NULL);
     cfg_load("cfg-probe-missing.ini");
     int listed = 0;
+    plat_setenv("TOTK_REALTIME", NULL);
+    plat_setenv("DKB_REALTIME", NULL);
+    CHECK(cfg_bool("TOTK_REALTIME") == (rt_game_version != 0), "real-time default: Bananza off, TotK on");
+    CHECK(!cfg_meta("REALTIME")->live, "real-time opt-in needs a restart");
+    cfg_set("TOTK_REALTIME", "1");
+    CHECK(cfg_bool("TOTK_REALTIME"), "explicit real-time opt-in overrides the default");
+    cfg_set("TOTK_REALTIME", "0");
+    CHECK(!cfg_bool("TOTK_REALTIME"), "explicit real-time opt-out overrides the default");
+    static const char *const realtime_key[] = {"REALTIME"};
+    cfg_reset(realtime_key, 1);
+    CHECK(cfg_bool("TOTK_REALTIME") == (rt_game_version != 0), "reset restores the game's real-time default");
     for (int i = 0; cfg_meta_at(i); i++) {
         const CfgMeta *m = cfg_meta_at(i);
         if (!*m->def) continue;

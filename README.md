@@ -13,15 +13,15 @@ Usa um assistente de IA? Peça para ele seguir [`amigos/AGENTS.md`](amigos/AGENT
 
 ### Jeito fácil: um comando só
 
-Abra o PowerShell, cole o comando abaixo e, quando pedir, escolha a pasta do seu dump:
+Abra o PowerShell, cole o comando abaixo e, quando pedir, escolha onde instalar (pode ser outra unidade) e a pasta do seu dump:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/sostenesfreitas/dkb-pc-recomp/local-prs/amigos/instalar-dk.ps1 | iex"
 ```
 
-Ele confere o PC e o dump, instala o que faltar, compila tudo em `%USERPROFILE%\dkb-pc-recomp`, roda o autoteste e cria o atalho **Donkey Kong Bananza** na Área de Trabalho. O Windows pode pedir permissão de administrador para instalar as ferramentas. Se algo falhar ou você quiser atualizar, rode o mesmo comando de novo. Antes de colar, você pode ler o script em [`amigos/instalar-dk.ps1`](amigos/instalar-dk.ps1).
+Ele confere o PC e o dump, instala o que faltar, compila tudo em `dkb-pc-recomp` dentro da pasta escolhida, roda o autoteste e cria o atalho **Donkey Kong Bananza** na Área de Trabalho. O Windows pode pedir permissão de administrador para instalar as ferramentas. Se algo falhar ou você quiser atualizar, rode o mesmo comando de novo. Antes de colar, você pode ler o script em [`amigos/instalar-dk.ps1`](amigos/instalar-dk.ps1).
 
-Você ainda precisa do próprio dump da versão 1.0.0 e de 16 GB de RAM e 60 GB livres. O instalador só foi testado em um PC que já tinha as ferramentas; em um PC limpo, se ele parar, mande o registro `%TEMP%\dkb-instalar.log`.
+Você ainda precisa do próprio dump da versão 1.0.0 e de 16 GB de RAM e 60 GB livres na unidade escolhida. As ferramentas (MSYS2, Visual Studio) sempre vão para `C:`. O instalador só foi testado em um PC que já tinha as ferramentas; em um PC limpo, se ele parar, mande o registro `%TEMP%\dkb-instalar.log`.
 
 As etapas abaixo são o mesmo processo, passo a passo, para quem prefere fazer à mão.
 

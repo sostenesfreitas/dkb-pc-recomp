@@ -4,7 +4,6 @@
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Windows.Forms
 
-$pasta = if ($env:DK_PASTA) { $env:DK_PASTA } else { Join-Path $env:USERPROFILE 'dkb-pc-recomp' }
 $log = Join-Path $env:TEMP 'dkb-instalar.log'
 
 function Parar($msg) {
@@ -42,6 +41,17 @@ $visivel = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMem
 $ram = [math]::Max([math]::Round((Get-CimInstance Win32_PhysicalMemory | Measure-Object Capacity -Sum).Sum / 1GB), $visivel)
 if ($ram -lt 16) { Parar "precisa de 16 GB de RAM; este PC tem $ram GB." }
 if ($visivel -lt 15) { Write-Host "AVISO: o Windows so pode usar $visivel GB dos $ram GB, e o jogo usa cerca de 13 GB. Feche os outros programas antes de jogar; pode travar." -ForegroundColor Yellow }
+$pasta = $env:DK_PASTA
+if (-not $pasta) {
+    Write-Host 'Escolha onde instalar (a janela pode abrir atras desta). Para atualizar, escolha a mesma pasta.'
+    $d = New-Object System.Windows.Forms.FolderBrowserDialog
+    $d.Description = 'Escolha onde instalar (precisa de 60 GB livres). Sera criada a pasta dkb-pc-recomp aqui dentro.'
+    $d.SelectedPath = $env:USERPROFILE
+    if ($d.ShowDialog() -ne 'OK') { Parar 'nenhuma pasta escolhida.' }
+    # Picking an existing install resumes it instead of nesting a second one inside it
+    $pasta = if (Test-Path (Join-Path $d.SelectedPath '.git')) { $d.SelectedPath } else { Join-Path $d.SelectedPath 'dkb-pc-recomp' }
+}
+if ($pasta -notmatch '^[A-Za-z]:\\') { Parar "escolha uma pasta em uma unidade com letra, nao: $pasta" }
 $unidade = (Split-Path $pasta -Qualifier).TrimEnd(':')
 $livre = [math]::Floor((Get-PSDrive $unidade).Free / 1GB)
 $feito = Test-Path (Join-Path $pasta 'build\extracted\dkb100\romfs')
